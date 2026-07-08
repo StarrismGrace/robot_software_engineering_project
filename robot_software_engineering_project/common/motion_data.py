@@ -17,6 +17,7 @@ import numpy as np
 # ============================================================
 BOOSTER_T1_JOINT_NAMES: List[str] = [
     "root",
+    "waist",
     "chest",
     "neck",
     "head",
@@ -40,7 +41,7 @@ BOOSTER_T1_JOINT_NAMES: List[str] = [
     "right_thigh",
 ]
 
-BOOSTER_T1_NUM_JOINTS: int = len(BOOSTER_T1_JOINT_NAMES)  # 22（实际列表中23指保留扩展位）
+BOOSTER_T1_NUM_JOINTS: int = len(BOOSTER_T1_JOINT_NAMES)  # 23
 
 
 @dataclass

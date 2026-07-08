@@ -255,6 +255,7 @@ def _get_joint_angle_limits() -> dict:
     """
     return {
         "root":          (-0.3, 0.3),     # 躯干根：小范围晃动
+        "waist":         (-0.5, 0.5),     # 腰部旋转
         "chest":         (-0.4, 0.4),
         "neck":          (-0.5, 0.5),
         "head":          (-0.6, 0.6),
