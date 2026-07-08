@@ -2,6 +2,7 @@
 单元测试 - 视频处理模块 (成员E)
 测试 VideoProcessor 是否能正确读取视频并抽帧
 """
+
 import os
 import pytest
 import numpy as np
@@ -16,7 +17,7 @@ class TestVideoProcessor:
         video_path = os.path.join(os.path.dirname(__file__), "test_video1.mp4")
         vp = VideoProcessor()
         frames = vp.extract_frames(video_path)
-        
+
         assert frames is not None, "返回结果不应为 None"
         assert isinstance(frames, list), "返回结果应为列表"
         assert len(frames) > 0, "帧列表不能为空"
@@ -34,14 +35,16 @@ class TestVideoProcessor:
         # 帧数应该约为原来的一半（允许误差）
         total_meta = meta["total_frames"]
         expected = total_meta / 2
-        assert abs(len(frames) - expected) < 5, f"抽帧数量与预期不符: {len(frames)} vs {expected}"
+        assert (
+            abs(len(frames) - expected) < 5
+        ), f"抽帧数量与预期不符: {len(frames)} vs {expected}"
 
     def test_get_video_metadata(self):
         """测试：获取视频元信息"""
         video_path = os.path.join(os.path.dirname(__file__), "test_video1.mp4")
         vp = VideoProcessor()
         meta = vp.get_video_metadata(video_path)
-        
+
         assert "fps" in meta
         assert "total_frames" in meta
         assert "duration_sec" in meta
@@ -59,6 +62,7 @@ class TestVideoProcessor:
     def test_extract_frames_invalid_video(self):
         """测试：给定无效视频文件（如文本文件），应抛出 ValueError"""
         import tempfile
+
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             f.write(b"not a video")
             temp_path = f.name
@@ -77,4 +81,6 @@ class TestVideoProcessor:
         # 只取前 1 秒
         frames = vp.extract_frames(video_path, start_sec=0, end_sec=1.0)
         expected = int(meta["fps"] * 1.0)
-        assert abs(len(frames) - expected) < 5, f"帧数不符预期: {len(frames)} vs {expected}"
+        assert (
+            abs(len(frames) - expected) < 5
+        ), f"帧数不符预期: {len(frames)} vs {expected}"

@@ -2,6 +2,7 @@
 视频处理模块 - 成员E
 职责：读取输入视频，按固定帧率抽帧，输出图像列表
 """
+
 import os
 import cv2
 import numpy as np
@@ -57,7 +58,11 @@ class VideoProcessor(VideoProcessor):
 
         # 4. 确定起始和结束帧
         start_frame = int(start_sec * original_fps) if original_fps > 0 else 0
-        end_frame = int(end_sec * original_fps) if end_sec is not None and original_fps > 0 else total_frames
+        end_frame = (
+            int(end_sec * original_fps)
+            if end_sec is not None and original_fps > 0
+            else total_frames
+        )
         start_frame = max(0, start_frame)
         end_frame = min(total_frames, end_frame)
 
