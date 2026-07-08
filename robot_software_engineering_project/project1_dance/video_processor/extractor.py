@@ -5,54 +5,119 @@
 import os
 import cv2
 import numpy as np
-from typing import List, Optional
-from common.interfaces import VideoProcessorInterface
+from typing import List, Optional, Union
+from pathlib import Path
+from common.interfaces import VideoProcessor
 
 
-class VideoProcessor(VideoProcessorInterface):
+class VideoProcessor(VideoProcessor):
     """
-    视频处理类，继承自 VideoProcessorInterface
-    实现 process() 方法：读取视频 → 抽帧 → 返回图像列表
+    视频处理类，继承自 common.interfaces.VideoProcessor
+    实现 extract_frames() 和 get_video_metadata() 方法
     """
 
-    def process(self, video_path: str) -> Optional[List[np.ndarray]]:
+    def extract_frames(
+        self,
+        video_path: Union[str, Path],
+        fps: Optional[int] = None,
+        start_sec: float = 0.0,
+        end_sec: Optional[float] = None,
+    ) -> List[np.ndarray]:
         """
-        处理视频文件，返回图像列表
+        从视频中抽取帧图像
 
         Args:
-            video_path: 视频文件的路径
+            video_path: 输入视频文件路径
+            fps: 抽帧目标帧率，为 None 时使用视频原始帧率
+            start_sec: 起始时间（秒），默认 0
+            end_sec: 结束时间（秒），为 None 时到视频结尾
 
         Returns:
-            List[np.ndarray]: 图像列表，每个元素是 RGB 格式的 numpy 数组
+            List[np.ndarray]: 帧图像列表，每帧为 (H, W, 3) 的 BGR ndarray (uint8)
 
         Raises:
             FileNotFoundError: 视频文件不存在
             ValueError: 视频无法打开或解码
         """
+        video_path = Path(video_path)
+
         # 1. 检查文件是否存在
-        if not os.path.exists(video_path):
+        if not video_path.exists():
             raise FileNotFoundError(f"视频文件不存在: {video_path}")
 
         # 2. 打开视频
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise ValueError(f"无法打开视频文件: {video_path}")
 
-        # 3. 抽帧（每隔 N 帧取一帧，可配置）
-        frame_interval = 1  # 每1帧都取，可改为 2 或 3
-        frames = []
-        frame_count = 0
+        # 3. 获取视频元信息
+        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / original_fps if original_fps > 0 else 0
 
-        while True:
+        # 4. 确定起始和结束帧
+        start_frame = int(start_sec * original_fps) if original_fps > 0 else 0
+        end_frame = int(end_sec * original_fps) if end_sec is not None and original_fps > 0 else total_frames
+        start_frame = max(0, start_frame)
+        end_frame = min(total_frames, end_frame)
+
+        # 5. 确定抽帧间隔
+        if fps is not None and fps > 0 and original_fps > 0:
+            interval = max(1, int(original_fps / fps))
+        else:
+            interval = 1  # 每帧都取
+
+        # 6. 跳转到起始帧
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        # 7. 抽帧
+        frames = []
+        frame_count = start_frame
+        while frame_count < end_frame:
             ret, frame = cap.read()
             if not ret:
                 break
-            if frame_count % frame_interval == 0:
-                # 将 BGR 转换为 RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(frame_rgb)
+            if (frame_count - start_frame) % interval == 0:
+                frames.append(frame)  # OpenCV 默认 BGR，接口要求 BGR
             frame_count += 1
 
-        # 4. 释放资源并返回
         cap.release()
         return frames
+
+    def get_video_metadata(
+        self,
+        video_path: Union[str, Path],
+    ) -> dict:
+        """
+        读取视频元信息
+
+        Args:
+            video_path: 输入视频文件路径
+
+        Returns:
+            dict: 包含 keys: fps, total_frames, duration_sec, width, height
+        """
+        video_path = Path(video_path)
+
+        if not video_path.exists():
+            raise FileNotFoundError(f"视频文件不存在: {video_path}")
+
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"无法打开视频文件: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration_sec = total_frames / fps if fps > 0 else 0
+
+        cap.release()
+
+        return {
+            "fps": fps,
+            "total_frames": total_frames,
+            "duration_sec": duration_sec,
+            "width": width,
+            "height": height,
+        }
