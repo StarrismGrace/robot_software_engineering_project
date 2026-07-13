@@ -1,5 +1,5 @@
 """
-从舞蹈视频提取 Booster T1 关节轨迹 (ONNX 姿态估计 v2)
+从舞蹈视频提取 Booster T1 关节轨迹 (MediaPipe 3D 姿态)
 用法: python scripts/extract_trajectory.py
 """
 import sys
@@ -8,56 +8,73 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import cv2
-import onnxruntime as ort
-
+import mediapipe as mp
+from mediapipe.tasks import python as mtp
+from mediapipe.tasks.python import vision
 import mujoco
 from common.motion_data import MotionData, BOOSTER_T1_JOINT_NAMES
+from scipy.signal import savgol_filter
 
 VIDEO_PATH = "inputs/dance.mp4"
-MODEL_PATH = "models/yolov8n-pose.onnx"
 OUTPUT_NPY = "outputs/trajectory.npy"
 FPS_TARGET = 30
-IMG_SIZE = 640
 
-# 关键点索引
+# MediaPipe 33个关键点索引
 NOSE = 0
-L_SHOULDER, R_SHOULDER = 5, 6
-L_ELBOW, R_ELBOW = 7, 8
-L_WRIST, R_WRIST = 9, 10
-L_HIP, R_HIP = 11, 12
-L_KNEE, R_KNEE = 13, 14
-L_ANKLE, R_ANKLE = 15, 16
+L_SHOULDER, R_SHOULDER = 11, 12
+L_ELBOW, R_ELBOW = 13, 14
+L_WRIST, R_WRIST = 15, 16
+L_HIP, R_HIP = 23, 24
+L_KNEE, R_KNEE = 25, 26
+L_ANKLE, R_ANKLE = 27, 28
+L_HEEL, R_HEEL = 29, 30
+L_FOOT, R_FOOT = 31, 32
+L_EAR, R_EAR = 7, 8
+MID_HIP = -1  # 左右髋中点（虚拟）
+
+
+def angle_between_3d(v1, v2):
+    """3D向量夹角"""
+    cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+    return np.arccos(np.clip(cos, -1, 1))
 
 
 def extract_trajectory(video_path):
-    session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, int(fps / FPS_TARGET))
-    print(f"视频: {fps:.0f}fps, {total}帧, 步长={step}")
+    # 加载模型
+    with open("models/pose_landmarker.task", "wb") as f:
+        pass  # placehold
 
-    # home 姿态 (站立基准)
+    # MediaPipe PoseLandmarker 配置
+    base_options = mtp.BaseOptions(
+        model_asset_path="models/pose_landmarker_lite.task"
+    )
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    detector = vision.PoseLandmarker.create_from_options(options)
+
+    cap = cv2.VideoCapture(video_path)
+    fps_in = cap.get(cv2.CAP_PROP_FPS)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, int(fps_in / FPS_TARGET))
+    print(f"视频: {fps_in:.0f}fps, {total}帧, 步长={step}")
+
+    # home 姿态
     mj_model = mujoco.MjModel.from_xml_path("scene.xml")
     mj_data = mujoco.MjData(mj_model)
     mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
     home_ctrl = mj_data.ctrl.copy()
 
-    all_angles = []
+    all_world = []  # 存储3D世界坐标
     frame_idx = 0
     saved = 0
-    prev_kpts = None
 
-    # 累积统计用于归一化
-    motion_history = {k: [] for k in [
-        "lh_pitch", "rh_pitch", "lk_angle", "rk_angle",
-        "lw_y", "rw_y", "le_angle", "re_angle",
-        "torso_sway", "head_y"
-    ]}
-
-    # ---- 第一遍：收集所有关键点和运动数据 ----
-    print("第一遍: 检测姿态...")
-    raw_motions = []
+    # 第一遍: 提取3D姿态
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -66,175 +83,143 @@ def extract_trajectory(video_path):
             frame_idx += 1
             continue
 
-        h, w = frame.shape[:2]
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
-        img = np.expand_dims(np.transpose(img, (2, 0, 1)), 0)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = int(frame_idx / fps_in * 1000)
 
-        preds = session.run(None, {"images": img})[0][0]
-        best = int(np.argmax(preds[4]))
-        if preds[4, best] < 0.3:
-            frame_idx += 1
-            continue
+        result = detector.detect_for_video(mp_image, timestamp_ms)
 
-        kpts = np.zeros((17, 2))
-        for k in range(17):
-            kpts[k, 0] = (preds[5 + k * 3, best] / IMG_SIZE) * w
-            kpts[k, 1] = (preds[5 + k * 3 + 1, best] / IMG_SIZE) * h
-        prev_kpts = kpts
+        if result.pose_world_landmarks and len(result.pose_world_landmarks) > 0:
+            wlm = result.pose_world_landmarks[0]  # 3D 世界坐标(米)
+            kpts_3d = np.zeros((33, 3))
+            for i in range(33):
+                kpts_3d[i] = [wlm[i].x, wlm[i].y, wlm[i].z]
+            all_world.append(kpts_3d)
+            saved += 1
+        elif all_world:
+            all_world.append(all_world[-1].copy())  # 保持上一帧
+            saved += 1
 
-        # 核心测量
-        m_shoulder = (kpts[L_SHOULDER] + kpts[R_SHOULDER]) / 2
-        m_hip = (kpts[L_HIP] + kpts[R_HIP]) / 2
-        body_h = np.linalg.norm(m_shoulder - m_hip) + 1e-8
-
-        # 左腿: 髋-膝-踝角度
-        lh = kpts[L_HIP]; lk = kpts[L_KNEE]; la = kpts[L_ANKLE]
-        l_thigh = lk - lh; l_shin = la - lk
-        l_hip_angle = np.arctan2(l_thigh[0], -l_thigh[1])  # 髋关节摆动
-        l_knee_angle = np.arccos(np.clip(
-            np.dot(-l_thigh, l_shin) / (np.linalg.norm(l_thigh) * np.linalg.norm(l_shin) + 1e-8), -1, 1))
-
-        # 右腿
-        rh = kpts[R_HIP]; rk = kpts[R_KNEE]; ra = kpts[R_ANKLE]
-        r_thigh = rk - rh; r_shin = ra - rk
-        r_hip_angle = np.arctan2(r_thigh[0], -r_thigh[1])
-        r_knee_angle = np.arccos(np.clip(
-            np.dot(-r_thigh, r_shin) / (np.linalg.norm(r_thigh) * np.linalg.norm(r_shin) + 1e-8), -1, 1))
-
-        # 手臂相对于躯干的位置
-        lw_rel_y = (kpts[L_WRIST, 1] - m_shoulder[1]) / body_h
-        rw_rel_y = (kpts[R_WRIST, 1] - m_shoulder[1]) / body_h
-
-        # 肘部角度
-        ls = kpts[L_SHOULDER]; le = kpts[L_ELBOW]; lw = kpts[L_WRIST]
-        l_upper = le - ls; l_forearm = lw - le
-        l_elbow = np.arccos(np.clip(
-            np.dot(-l_upper, l_forearm) / (np.linalg.norm(l_upper) * np.linalg.norm(l_forearm) + 1e-8), -1, 1))
-
-        rs = kpts[R_SHOULDER]; re = kpts[R_ELBOW]; rw = kpts[R_WRIST]
-        r_upper = re - rs; r_forearm = rw - re
-        r_elbow = np.arccos(np.clip(
-            np.dot(-r_upper, r_forearm) / (np.linalg.norm(r_upper) * np.linalg.norm(r_forearm) + 1e-8), -1, 1))
-
-        # 躯干摇摆
-        torso_sway = (m_shoulder[0] - m_hip[0]) / body_h
-
-        # 头部位置
-        head_y = (kpts[NOSE, 1] - m_shoulder[1]) / body_h
-
-        raw_motions.append({
-            "lh_pitch": l_hip_angle, "rh_pitch": r_hip_angle,
-            "lk_angle": l_knee_angle, "rk_angle": r_knee_angle,
-            "lw_y": lw_rel_y, "rw_y": rw_rel_y,
-            "le_angle": l_elbow, "re_angle": r_elbow,
-            "torso_sway": torso_sway, "head_y": head_y,
-        })
-
-        for k, v in raw_motions[-1].items():
-            motion_history[k].append(v)
-
-        saved += 1
         frame_idx += 1
         if saved % 50 == 0:
-            print(f"  已检测 {saved} 帧...")
+            print(f"  3D姿态: {saved} 帧...")
 
     cap.release()
+    detector.close()
 
     if saved < 10:
-        print("姿态太少!")
+        print(f"3D姿态不足: {saved}")
         return None
+    print(f"第一遍: {saved} 帧 3D 姿态已提取")
 
-    # ---- 第二遍: 归一化并映射到机器人关节 ----
-    print(f"\n第二遍: 映射 {saved} 帧到机器人关节...")
-
-    # 计算各通道的均值和标准差用于归一化
-    stats = {}
-    for k, vals in motion_history.items():
-        v = np.array(vals)
-        stats[k] = {"mean": float(np.mean(v)), "std": float(np.std(v))}
-
+    # ---- 第二遍: 3D关节角 → 机器人关节 ----
     all_offsets = []
-    for i, rm in enumerate(raw_motions):
-        # 归一化到 [-1, 1]
-        def norm(key, default=0.0):
-            s = stats[key]
-            if s["std"] < 0.01:
-                return default
-            return float(np.clip((rm[key] - s["mean"]) / (s["std"] * 2), -1.0, 1.0))
 
-        lhp = norm("lh_pitch")
-        rhp = norm("rh_pitch")
-        lka = norm("lk_angle")
-        rka = norm("rk_angle")
-        lwy = norm("lw_y")
-        rwy = norm("rw_y")
-        lea = norm("le_angle")
-        rea = norm("re_angle")
-        ts = norm("torso_sway")
-        hy = norm("head_y")
+    for t in range(saved):
+        k = all_world[t]
 
-        # 映射到关节角度偏移（幅度控制在安全范围内）
+        # 中心点
+        m_sh = (k[L_SHOULDER] + k[R_SHOULDER]) / 2
+        m_hip = (k[L_HIP] + k[R_HIP]) / 2
+        body_h = max(np.linalg.norm(m_sh - m_hip), 0.1)
+
+        # ---- 头部 (Nose相对肩膀) ----
+        head_pos = k[NOSE] - m_sh
+        head_yaw = np.arctan2(head_pos[0], abs(head_pos[2]) + 1e-3)
+        head_pitch = np.arctan2(head_pos[1], abs(head_pos[2]) + 1e-3)
+
+        # ---- 左臂 ----
+        l_up = k[L_ELBOW] - k[L_SHOULDER]
+        l_fore = k[L_WRIST] - k[L_ELBOW]
+        # 肩Pitch: 上臂在矢状面(YZ)的角度
+        l_sh_pitch = np.arctan2(l_up[1], abs(l_up[2]) + 1e-3)
+        # 肩Roll: 上臂在冠状面(XZ)的角度
+        l_sh_roll = np.arctan2(l_up[0], abs(l_up[2]) + 1e-3)
+        # 肘Pitch
+        l_el = angle_between_3d(-l_up, l_fore)
+
+        # ---- 右臂 ----
+        r_up = k[R_ELBOW] - k[R_SHOULDER]
+        r_fore = k[R_WRIST] - k[R_ELBOW]
+        r_sh_pitch = np.arctan2(r_up[1], abs(r_up[2]) + 1e-3)
+        r_sh_roll = np.arctan2(r_up[0], abs(r_up[2]) + 1e-3)
+        r_el = angle_between_3d(-r_up, r_fore)
+
+        # ---- 左腿 ----
+        l_th = k[L_KNEE] - k[L_HIP]
+        l_shin = k[L_ANKLE] - k[L_KNEE]
+        l_hip_pitch = np.arctan2(l_th[1], abs(l_th[2]) + 1e-3)
+        l_hip_roll = np.arctan2(l_th[0], abs(l_th[2]) + 1e-3)
+        l_knee = angle_between_3d(-l_th, l_shin)
+
+        # ---- 右腿 ----
+        r_th = k[R_KNEE] - k[R_HIP]
+        r_shin = k[R_ANKLE] - k[R_KNEE]
+        r_hip_pitch = np.arctan2(r_th[1], abs(r_th[2]) + 1e-3)
+        r_hip_roll = np.arctan2(r_th[0], abs(r_th[2]) + 1e-3)
+        r_knee = angle_between_3d(-r_th, r_shin)
+
+        # ---- 躯干 ----
+        torso_vec = m_sh - m_hip
+        waist_yaw = np.arctan2(torso_vec[0], abs(torso_vec[2]) + 1e-3)
+
+        # ---- 映射到23个执行器 ----
         angles = home_ctrl.copy()
-
-        # 头: yaw(0), pitch(1)
-        angles[0] += hy * 0.3
-        angles[1] += hy * 0.15
-
-        # 左臂: Shoulder_Pitch(2), Shoulder_Roll(3), Elbow_Pitch(4), Elbow_Yaw(5)
-        angles[2] += lwy * 0.8       # 手臂上下
-        angles[3] += lwy * 0.3       # 手臂旋转
-        angles[4] += lea * 0.6       # 肘弯曲
-        angles[5] = home_ctrl[5]     # 保持 home 值
-
-        # 右臂: Shoulder_Pitch(6), Shoulder_Roll(7), Elbow_Pitch(8), Elbow_Yaw(9)
-        angles[6] += rwy * 0.8
-        angles[7] += rwy * 0.3
-        angles[8] += rea * 0.6
+        angles[0] = np.clip(float(head_yaw * 1.5), -1.5, 1.5)    # AAHead_yaw
+        angles[1] = np.clip(float(-head_pitch * 0.6), -0.3, 1.2) # Head_pitch
+        angles[2] = np.clip(float(-l_sh_pitch * 1.5), -3.0, 1.2) # L_Shoulder_Pitch
+        angles[3] = np.clip(float(l_sh_roll * 1.5), -1.7, 1.5)   # L_Shoulder_Roll
+        angles[4] = np.clip(float((l_el - np.pi / 3) * 1.2), -2.2, 2.2) # L_Elbow_Pitch
+        angles[5] = home_ctrl[5]
+        angles[6] = np.clip(float(-r_sh_pitch * 1.5), -3.0, 1.2) # R_Shoulder_Pitch
+        angles[7] = np.clip(float(r_sh_roll * 1.5), -1.5, 1.7)   # R_Shoulder_Roll
+        angles[8] = np.clip(float((r_el - np.pi / 3) * 1.2), -2.2, 2.2) # R_Elbow_Pitch
         angles[9] = home_ctrl[9]
-
-        # 躯干: Waist(10)
-        angles[10] += ts * 0.5
-
-        # 左腿: Hip_Pitch(11), Hip_Roll(12), Hip_Yaw(13), Knee_Pitch(14), Ankle_Pitch(15), Ankle_Roll(16)
-        angles[11] += lhp * 0.5
-        angles[12] = home_ctrl[12]
+        angles[10] = np.clip(float(waist_yaw * 0.8), -1.5, 1.5)  # Waist
+        angles[11] = np.clip(float(l_hip_pitch * 1.0), -1.8, 1.5) # L_Hip_Pitch
+        angles[12] = np.clip(float(l_hip_roll * 1.0), -0.2, 1.5)  # L_Hip_Roll
         angles[13] = home_ctrl[13]
-        angles[14] += lka * 0.5
+        angles[14] = np.clip(float(l_knee * 0.8), 0, 2.3)         # L_Knee_Pitch
         angles[15] = home_ctrl[15]
         angles[16] = home_ctrl[16]
-
-        # 右腿: Hip_Pitch(17), Hip_Roll(18), Hip_Yaw(19), Knee_Pitch(20), Ankle_Pitch(21), Ankle_Roll(22)
-        angles[17] += rhp * 0.5
-        angles[18] = home_ctrl[18]
+        angles[17] = np.clip(float(r_hip_pitch * 1.0), -1.8, 1.5) # R_Hip_Pitch
+        angles[18] = np.clip(float(r_hip_roll * 1.0), -1.5, 0.2)  # R_Hip_Roll
         angles[19] = home_ctrl[19]
-        angles[20] += rka * 0.5
+        angles[20] = np.clip(float(r_knee * 0.8), 0, 2.3)         # R_Knee_Pitch
         angles[21] = home_ctrl[21]
         angles[22] = home_ctrl[22]
 
         all_offsets.append(angles - home_ctrl)
 
     # 平滑
-    angles_array = np.array(all_offsets)
-    from scipy.signal import savgol_filter
+    offsets = np.array(all_offsets)
     for j in range(23):
         try:
-            w = min(11, max(3, len(all_offsets) // 3))
+            w = min(9, max(3, saved // 3))
             if w % 2 == 0:
                 w -= 1
             if w >= 3:
-                angles_array[:, j] = savgol_filter(angles_array[:, j], w, 2)
+                offsets[:, j] = savgol_filter(offsets[:, j], w, 2)
         except Exception:
             pass
 
-    print(f"完成: {saved} 帧, shape={angles_array.shape}")
-    print(f"关节运动范围:")
+    # 统计
+    act_names = [
+        "AAHead_yaw", "Head_pitch",
+        "L_Shoulder_Pitch", "L_Shoulder_Roll", "L_Elbow_Pitch", "L_Elbow_Yaw",
+        "R_Shoulder_Pitch", "R_Shoulder_Roll", "R_Elbow_Pitch", "R_Elbow_Yaw",
+        "Waist",
+        "L_Hip_Pitch", "L_Hip_Roll", "L_Hip_Yaw", "L_Knee_Pitch", "L_Ankle_Pitch", "L_Ankle_Roll",
+        "R_Hip_Pitch", "R_Hip_Roll", "R_Hip_Yaw", "R_Knee_Pitch", "R_Ankle_Pitch", "R_Ankle_Roll",
+    ]
+    print(f"\n完成: {saved} 帧 3D轨迹")
+    print("运动关节:")
     for j in range(23):
-        rng = angles_array[:, j].max() - angles_array[:, j].min()
-        if rng > 0.05:
-            print(f"  [{j}] {BOOSTER_T1_JOINT_NAMES[j]}: {angles_array[:, j].min():.2f} ~ {angles_array[:, j].max():.2f}")
+        rng = offsets[:, j].max() - offsets[:, j].min()
+        if rng > 0.02:
+            print(f"  {act_names[j]:20s} [{offsets[:, j].min():+.2f} ~ {offsets[:, j].max():+.2f}]")
 
-    return angles_array, saved
+    return offsets, saved
 
 
 def save_trajectory(angles, num_frames):
@@ -247,12 +232,14 @@ def save_trajectory(angles, num_frames):
         num_frames=num_frames, angles=angles,
         timestamps=np.arange(num_frames) / FPS_TARGET,
     )
-    print(f"MotionData: {motion.num_joints} 关节, {motion.num_frames} 帧, {motion.duration:.1f}s")
+    print(f"MotionData: {motion.num_joints}关节, {motion.num_frames}帧, {motion.duration:.1f}s")
 
 
 if __name__ == "__main__":
+    import os
+    os.makedirs("outputs", exist_ok=True)
     result = extract_trajectory(VIDEO_PATH)
     if result is not None:
         angles, num_frames = result
         save_trajectory(angles, num_frames)
-        print("\n运行 python scripts/demo_play.py 查看效果")
+        print("\n运行 python scripts/demo_play.py 查看")
