@@ -1,7 +1,6 @@
 """
-从舞蹈视频生成 Booster T1 关节轨迹（光流追踪方案）
+从舞蹈视频提取 Booster T1 关节轨迹 (ONNX 姿态估计)
 用法: python scripts/extract_trajectory.py
-无需任何外部模型，仅用 OpenCV + NumPy
 """
 import sys
 from pathlib import Path
@@ -9,62 +8,56 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import cv2
+import onnxruntime as ort
 import json
 
 import mujoco
 from common.motion_data import MotionData, BOOSTER_T1_JOINT_NAMES
 
 VIDEO_PATH = "inputs/dance.mp4"
+MODEL_PATH = "models/yolov8n-pose.onnx"
 OUTPUT_NPY = "outputs/trajectory.npy"
-OUTPUT_JSON = "outputs/trajectory.json"
 FPS_TARGET = 30
+
+# COCO 17关键点
+NOSE = 0; L_EYE = 1; R_EYE = 2; L_EAR = 3; R_EAR = 4
+L_SHOULDER = 5; R_SHOULDER = 6
+L_ELBOW = 7; R_ELBOW = 8
+L_WRIST = 9; R_WRIST = 10
+L_HIP = 11; R_HIP = 12
+L_KNEE = 13; R_KNEE = 14
+L_ANKLE = 15; R_ANKLE = 16
+
+IMG_SIZE = 640
+
+
+def angle_between(v1, v2):
+    cos = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+    return np.arccos(np.clip(cos, -1, 1))
 
 
 def extract_trajectory(video_path):
+    # 加载 ONNX 模型
+    session = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
+    print(f"ONNX 模型已加载: {MODEL_PATH}")
+
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, int(fps / FPS_TARGET))
-    print(f"视频: {fps:.1f} fps, {total_frames} 帧, 采样步长={step}")
+    print(f"视频: {fps:.1f} fps, {total_frames} 帧, 步长={step}")
 
-    # 加载 MuJoCo 模型获取 home 姿态
+    # 加载 home 姿态
     mj_model = mujoco.MjModel.from_xml_path("scene.xml")
     mj_data = mujoco.MjData(mj_model)
     if mj_model.nkey > 0:
         mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
     home_qpos = mj_data.qpos[7:].copy()
 
-    # 读取第一帧
-    ret, prev_frame = cap.read()
-    if not ret:
-        print("无法读取视频")
-        return None
-
-    h, w = prev_frame.shape[:2]
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-
-    # 在画面中检测特征点（人体轮廓点）
-    # 用边缘检测 + 网格采样获取追踪点
-    edges = cv2.Canny(prev_gray, 50, 150)
-    grid_y, grid_x = np.mgrid[80:h - 80:20, 80:w - 80:20]
-    grid_points = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-    # 过滤：只保留边缘附近的点
-    valid = []
-    for x, y in grid_points:
-        roi = edges[max(0, y - 5): min(h, y + 5), max(0, x - 5): min(w, x + 5)]
-        if roi.mean() > 20:
-            valid.append([x, y])
-    prev_points = np.array(valid, dtype=np.float32).reshape(-1, 1, 2)
-
-    if len(prev_points) < 10:
-        print("特征点太少，使用全网格")
-        prev_points = np.column_stack([grid_x.ravel(), grid_y.ravel()]).astype(np.float32).reshape(-1, 1, 2)
-
-    print(f"追踪 {len(prev_points)} 个特征点")
-
     all_angles = []
     frame_idx = 0
     saved = 0
+    prev_kpts = None
 
     while True:
         ret, frame = cap.read()
@@ -75,124 +68,118 @@ def extract_trajectory(video_path):
             frame_idx += 1
             continue
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = frame.shape[:2]
 
-        # 光流追踪
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray, gray, prev_points, None,
-            winSize=(21, 21), maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
+        # 预处理: resize + normalize
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, 0)
 
-        if next_points is None or len(next_points) < 5:
-            frame_idx += 1
-            continue
+        # 推理
+        outputs = session.run(None, {"images": img})
+        preds = outputs[0]  # (1, 56, 8400)
 
-        # 计算运动向量
-        good_prev = prev_points[status[:, 0] == 1]
-        good_next = next_points[status[:, 0] == 1]
-        motions = good_next - good_prev  # (N, 1, 2)
+        # 解析: 找最高置信度的检测
+        preds = preds[0]  # (56, 8400)
+        scores = preds[4, :]  # bbox 置信度
+        best_idx = int(np.argmax(scores))
 
-        if len(motions) < 3:
-            frame_idx += 1
-            continue
+        if scores[best_idx] < 0.3:
+            if prev_kpts is not None:
+                kpts = prev_kpts
+            else:
+                frame_idx += 1
+                continue
+        else:
+            # 提取关键点 (17个, 每个3个值: x, y, conf)
+            kpts = np.zeros((17, 2))
+            for k in range(17):
+                kx = preds[5 + k * 3, best_idx]
+                ky = preds[5 + k * 3 + 1, best_idx]
+                # 反归一化
+                kpts[k, 0] = (kx / IMG_SIZE) * w
+                kpts[k, 1] = (ky / IMG_SIZE) * h
+            prev_kpts = kpts.copy()
 
-        # 按图像区域分组（5个区域：头、左臂、右臂、左腿、右腿）
-        centers = good_prev[:, 0, :]
-        mid_x, mid_y = w / 2, h / 2
+        # ---- 计算关节角度 ----
+        mid_hip = (kpts[L_HIP] + kpts[R_HIP]) / 2
+        mid_shoulder = (kpts[L_SHOULDER] + kpts[R_SHOULDER]) / 2
+        scale = np.linalg.norm(mid_shoulder - mid_hip) + 1e-8
 
-        def region_mean(cx_min, cx_max, cy_min, cy_max):
-            mask = (
-                (centers[:, 0] >= cx_min) & (centers[:, 0] < cx_max)
-                & (centers[:, 1] >= cy_min) & (centers[:, 1] < cy_max)
-            )
-            if mask.sum() == 0:
-                return 0.0, 0.0, 1
-            mx = motions[mask, 0, 0].mean() / w
-            my = motions[mask, 0, 1].mean() / h
-            return mx, my, mask.sum()
+        # 头部
+        head_yaw = (kpts[NOSE, 0] - mid_shoulder[0]) / scale
+        head_pitch = (kpts[NOSE, 1] - mid_shoulder[1]) / scale
 
-        # 头部区域(上中)
-        head_mx, head_my, _ = region_mean(w * 0.3, w * 0.7, 0, h * 0.3)
-        # 左臂(左上 + 左中)
-        la_mx, la_my, _ = region_mean(0, w * 0.4, h * 0.1, h * 0.55)
-        # 右臂(右上 + 右中)
-        ra_mx, ra_my, _ = region_mean(w * 0.6, w, h * 0.1, h * 0.55)
-        # 躯干(中中)
-        torso_mx, torso_my, _ = region_mean(w * 0.3, w * 0.7, h * 0.25, h * 0.55)
-        # 左腿(左下)
-        ll_mx, ll_my, _ = region_mean(0, w * 0.45, h * 0.55, h)
-        # 右腿(右下)
-        rl_mx, rl_my, _ = region_mean(w * 0.55, w, h * 0.55, h)
+        # 左臂
+        ls = np.array([*kpts[L_SHOULDER], 0]); le = np.array([*kpts[L_ELBOW], 0]); lw = np.array([*kpts[L_WRIST], 0])
+        l_upper = le - ls; l_forearm = lw - le
+        la_pitch = np.arctan2(l_upper[1], l_upper[0] + 1e-8)
+        la_roll = np.arctan2(l_upper[2], np.linalg.norm(l_upper[:2]) + 1e-8)
+        la_elbow = angle_between(-l_upper, l_forearm)
 
-        # ---- 将运动映射到 23 个关节角度（叠加在 home 姿态上） ----
+        # 右臂
+        rs = np.array([*kpts[R_SHOULDER], 0]); re = np.array([*kpts[R_ELBOW], 0]); rw = np.array([*kpts[R_WRIST], 0])
+        r_upper = re - rs; r_forearm = rw - re
+        ra_pitch = np.arctan2(r_upper[1], r_upper[0] + 1e-8)
+        ra_roll = np.arctan2(r_upper[2], np.linalg.norm(r_upper[:2]) + 1e-8)
+        ra_elbow = angle_between(-r_upper, r_forearm)
+
+        # 左腿
+        lh = np.array([*kpts[L_HIP], 0]); lk = np.array([*kpts[L_KNEE], 0]); laa = np.array([*kpts[L_ANKLE], 0])
+        l_thigh = lk - lh; l_shin = laa - lk
+        lh_pitch = np.arctan2(l_thigh[1], l_thigh[0] + 1e-8)
+        lh_roll = np.arctan2(l_thigh[2], np.linalg.norm(l_thigh[:2]) + 1e-8)
+        l_knee = angle_between(-l_thigh, l_shin)
+
+        # 右腿
+        rh = np.array([*kpts[R_HIP], 0]); rk = np.array([*kpts[R_KNEE], 0]); raa = np.array([*kpts[R_ANKLE], 0])
+        r_thigh = rk - rh; r_shin = raa - rk
+        rh_pitch = np.arctan2(r_thigh[1], r_thigh[0] + 1e-8)
+        rh_roll = np.arctan2(r_thigh[2], np.linalg.norm(r_thigh[:2]) + 1e-8)
+        r_knee = angle_between(-r_thigh, r_shin)
+
+        # 躯干
+        torso = mid_shoulder - mid_hip
+        waist = np.arctan2(torso[0], torso[1] + 1e-8)
+
+        # ---- 映射到 23 个执行器 ----
         angles = home_qpos.copy()
-        scale = 2.5  # 运动幅度缩放
+        angles[0] = np.clip(head_yaw, -1.5, 1.5)
+        angles[1] = np.clip(-head_pitch * 0.5, -0.3, 1.2)
+        angles[2] = np.clip(-la_pitch, -3.0, 1.2)
+        angles[3] = np.clip(la_roll, -1.7, 1.5)
+        angles[4] = np.clip(la_elbow - 0.3, -2.2, 2.2)
+        angles[5] = 0.0
+        angles[6] = np.clip(-ra_pitch, -3.0, 1.2)
+        angles[7] = np.clip(ra_roll, -1.5, 1.7)
+        angles[8] = np.clip(ra_elbow - 0.3, -2.2, 2.2)
+        angles[9] = 0.0
+        angles[10] = np.clip(waist, -1.5, 1.5)
+        angles[11] = np.clip(lh_pitch, -1.8, 1.5)
+        angles[12] = np.clip(lh_roll, -0.2, 1.5)
+        angles[13] = 0.0
+        angles[14] = np.clip(l_knee, 0, 2.3)
+        angles[15] = 0.0
+        angles[16] = 0.0
+        angles[17] = np.clip(rh_pitch, -1.8, 1.5)
+        angles[18] = np.clip(rh_roll, -1.5, 0.2)
+        angles[19] = 0.0
+        angles[20] = np.clip(r_knee, 0, 2.3)
+        angles[21] = 0.0
+        angles[22] = 0.0
 
-        # 头 (0, 1): AAHead_yaw, Head_pitch
-        angles[0] += np.clip(head_mx * scale, -0.6, 0.6)
-        angles[1] += np.clip(-head_my * scale, -0.3, 0.3)
-
-        # 左臂 (2,3,4,5): Shoulder_Pitch, Shoulder_Roll, Elbow_Pitch, Elbow_Yaw
-        angles[2] += np.clip(-la_my * scale, -1.0, 0.8)
-        angles[3] += np.clip(la_mx * scale * 0.5, -0.5, 0.5)
-        angles[4] += np.clip(np.sqrt(la_mx ** 2 + la_my ** 2) * scale, -1.0, 1.0)
-        angles[5] += 0.0
-
-        # 右臂 (6,7,8,9)
-        angles[6] += np.clip(-ra_my * scale, -1.0, 0.8)
-        angles[7] += np.clip(ra_mx * scale * 0.5, -0.5, 0.5)
-        angles[8] += np.clip(np.sqrt(ra_mx ** 2 + ra_my ** 2) * scale, -1.0, 1.0)
-        angles[9] += 0.0
-
-        # 躯干 (10): Waist
-        angles[10] += np.clip(torso_mx * scale, -0.5, 0.5)
-
-        # 左腿 (11-16): Hip_Pitch, Hip_Roll, Hip_Yaw, Knee_Pitch, Ankle_Pitch, Ankle_Roll
-        angles[11] += np.clip(-ll_my * scale, -0.8, 0.8)
-        angles[12] += np.clip(ll_mx * scale * 0.3, -0.3, 0.3)
-        angles[13] += 0.0
-        angles[14] += np.clip(np.sqrt(ll_mx ** 2 + ll_my ** 2) * scale, 0, 1.2)
-        angles[15] += np.clip(ll_my * scale * 0.5, -0.3, 0.3)
-        angles[16] += 0.0
-
-        # 右腿 (17-22)
-        angles[17] += np.clip(-rl_my * scale, -0.8, 0.8)
-        angles[18] += np.clip(rl_mx * scale * 0.3, -0.3, 0.3)
-        angles[19] += 0.0
-        angles[20] += np.clip(np.sqrt(rl_mx ** 2 + rl_my ** 2) * scale, 0, 1.2)
-        angles[21] += np.clip(rl_my * scale * 0.5, -0.3, 0.3)
-        angles[22] += 0.0
-
-        all_angles.append(angles - home_qpos)  # 存偏移量
-
-        # 更新追踪点
-        prev_gray = gray
-        prev_points = good_next.reshape(-1, 1, 2)
-
-        # 定期重新检测特征点，防止漂移
-        if saved % 30 == 0 and saved > 0:
-            edges = cv2.Canny(gray, 50, 150)
-            new_grid = np.column_stack([grid_x.ravel(), grid_y.ravel()]).astype(np.float32)
-            valid_new = []
-            for x, y in new_grid:
-                xi, yi = int(x), int(y)
-                if 0 <= xi < w and 0 <= yi < h:
-                    roi = edges[max(0, yi - 3): min(h, yi + 3), max(0, xi - 3): min(w, xi + 3)]
-                    if roi.mean() > 15:
-                        valid_new.append([x, y])
-            if len(valid_new) > 20:
-                prev_points = np.array(valid_new, dtype=np.float32).reshape(-1, 1, 2)
-
+        all_angles.append(angles - home_qpos)
         saved += 1
         frame_idx += 1
         if saved % 30 == 0:
-            print(f"  已处理 {saved} 帧...")
+            print(f"  检测到人体, 已处理 {saved} 帧...")
 
     cap.release()
 
     if not all_angles:
-        print("错误: 无法提取运动信息")
+        print("错误: 未检测到人体!")
         return None
 
     angles_array = np.array(all_angles)
@@ -216,28 +203,14 @@ def extract_trajectory(video_path):
 def save_trajectory(angles, num_frames):
     import os
     os.makedirs("outputs", exist_ok=True)
-
     np.save(OUTPUT_NPY, angles)
-    print(f"轨迹文件: {OUTPUT_NPY} ({os.path.getsize(OUTPUT_NPY)} bytes)")
-
-    data = {
-        "joint_names": list(BOOSTER_T1_JOINT_NAMES),
-        "fps": FPS_TARGET,
-        "num_frames": num_frames,
-        "angles_shape": list(angles.shape),
-    }
-    with open(OUTPUT_JSON, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"轨迹文件: {OUTPUT_JSON}")
-
+    print(f"轨迹: {OUTPUT_NPY} ({os.path.getsize(OUTPUT_NPY)} bytes)")
     motion = MotionData(
-        joint_names=list(BOOSTER_T1_JOINT_NAMES),
-        fps=FPS_TARGET,
-        num_frames=num_frames,
-        angles=angles,
+        joint_names=list(BOOSTER_T1_JOINT_NAMES), fps=FPS_TARGET,
+        num_frames=num_frames, angles=angles,
         timestamps=np.arange(num_frames) / FPS_TARGET,
     )
-    print(f"MotionData OK: {motion.num_joints} joints, {motion.num_frames} frames, {motion.duration:.1f}s")
+    print(f"MotionData: {motion.num_joints} joints, {motion.num_frames} frames, {motion.duration:.1f}s")
 
 
 if __name__ == "__main__":
@@ -245,5 +218,4 @@ if __name__ == "__main__":
     if result is not None:
         angles, num_frames = result
         save_trajectory(angles, num_frames)
-        print(f"\n轨迹已生成! 运行:")
-        print(f"  python scripts/demo_play.py")
+        print("\n完成! 运行 python scripts/demo_play.py 或 demo_video.py")
