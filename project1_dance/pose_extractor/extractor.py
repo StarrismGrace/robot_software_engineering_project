@@ -1,54 +1,69 @@
+"""
+姿态提取模块 - PromptHMR 实现
+当前为联调占位 Mock 版本，完全对齐 Booster T1 标准接口
+TODO: 待获取预训练权重后，替换为真实深度学习推理
+"""
+import sys
+import os
+import numpy as np
+from typing import List
+
+# 自动补全项目根路径，解决模块导入问题
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+# 导入项目公共接口、数据结构与标准关节定义
 from common.interfaces import PoseExtractor
 from common.motion_data import MotionData, BOOSTER_T1_JOINT_NAMES
-from common.logger import setup_logger
-import numpy as np
+from common import setup_logger
 
-logger = setup_logger(__name__)
+logger = setup_logger("pose_extractor")
 
 
 class PromptHMRExtractor(PoseExtractor):
-    """基于PromptHMR的姿态提取实现（成员B负责模块）"""
+    """Mock 姿态提取器，用于接口联调；权重到位后可无缝替换为真实推理"""
 
-    def __init__(self):
-        self.model = None  # 后续接入真实模型时初始化
-        logger.info("姿态提取器初始化完成（当前为Mock实现）")
+    def __init__(self, **kwargs):
+        super().__init__()
+        logger.info("已加载 Mock 姿态提取器（联调占位版本）")
 
-    def extract(self, frames: list[np.ndarray],
-                fps: int, **kwargs) -> MotionData:
-        """
-        从图像序列中提取人体姿态，输出标准化MotionData
-        严格遵循公共接口：输入帧列表+帧率，输出MotionData（positions填充）
-        """
-        num_frames = len(frames)
-        num_joints = len(BOOSTER_T1_JOINT_NAMES)
-        logger.info(
-            f"开始姿态提取，输入帧数: {num_frames}, 帧率: {fps}"
-        )
+    def extract(
+        self,
+        frames: List[np.ndarray],
+        fps: int,
+        **kwargs,
+    ) -> MotionData:
+        total_frames = len(frames)
+        logger.info(f"Mock 姿态提取：模拟处理 {total_frames} 帧，帧率 {fps}")
 
-        # ========== 核心逻辑占位（后续替换为真实PromptHMR推理） ==========
-        # 真实实现时，这里会逐帧调用PromptHMR模型，输出人体3D关键点
-        # 再将关键点映射到Booster T1的23个标准关节，填充positions字段
+        # 生成模拟 23 个关节 3D 坐标，与 Booster T1 标准关节数严格对齐
+        dummy_joints = np.random.randn(total_frames, BOOSTER_T1_JOINT_NAMES.__len__(), 3) * 0.3
 
-        # Mock数据：生成符合形状要求的零值位置数据，先跑通全链路格式
-        mock_positions = np.zeros(
-            (num_frames, num_joints, 3), dtype=np.float32)
-
-        # 构造标准MotionData对象
         motion_data = MotionData(
-            joint_names=BOOSTER_T1_JOINT_NAMES.copy(),
+            joint_names=BOOSTER_T1_JOINT_NAMES,
             fps=fps,
-            num_frames=num_frames,
-            positions=mock_positions,
-            timestamps=np.arange(num_frames) / fps,  # 按帧率生成时间戳
+            num_frames=total_frames,
+            positions=dummy_joints,
         )
-
-        logger.info(f"姿态提取完成，输出: {motion_data}")
         return motion_data
 
     def get_joint_map(self) -> dict:
-        """返回PromptHMR关节到Booster T1标准关节的映射表"""
-        # 真实实现时补充完整映射关系，这里先返回空占位
+        """返回 SMPLX 关节到 Booster T1 标准关节的映射表"""
         joint_map = {
-            # 示例："human_hip": "left_hip"
+            "pelvis": "root",
+            "left_hip": "left_hip",
+            "right_hip": "right_hip",
+            "left_knee": "left_knee",
+            "right_knee": "right_knee",
+            "left_ankle": "left_ankle",
+            "right_ankle": "right_ankle",
+            "spine1": "waist",
+            "spine2": "chest",
+            "left_shoulder": "left_shoulder",
+            "right_shoulder": "right_shoulder",
+            "left_elbow": "left_elbow",
+            "right_elbow": "right_elbow",
+            "left_wrist": "left_wrist",
+            "right_wrist": "right_wrist",
+            "head": "head",
         }
         return joint_map
