@@ -18,6 +18,7 @@ build/
 venv/
 env/
 .venv/
+booster_dance/
 .env
 env.bak/
 venv.bak/
