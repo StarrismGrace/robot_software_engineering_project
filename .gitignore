@@ -82,3 +82,8 @@ models/
 *.key
 *.pem
 secrets/
+
+# 模型文件（太大，不入库）
+*.onnx
+*.task
+models/
