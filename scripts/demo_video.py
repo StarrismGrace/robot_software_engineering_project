@@ -1,7 +1,6 @@
 """
 成员F — 视频导出演示
 用法: python scripts/demo_video.py
-生成机器人跳舞的 MP4 视频文件
 """
 import sys
 from pathlib import Path
@@ -11,27 +10,31 @@ import numpy as np
 from common.motion_data import MotionData, BOOSTER_T1_JOINT_NAMES
 from project1_dance.mujoco_player.player import MuJoCoPlayerImpl
 
-# ---- 生成舞蹈动作（小幅摆动） ----
-T = 300  # 10秒
-J = 23
-angles = np.zeros((T, J))
-for t in range(T):
-    for j in range(J):
-        angles[t, j] = (
-            0.08 * np.sin(2 * np.pi * t / 120 + j * 0.4)
-            + 0.04 * np.sin(2 * np.pi * t / 60 + j * 0.7)
-            + 0.02 * np.cos(2 * np.pi * t / 200 + j * 0.2)
-        )
+TRAJECTORY_FILE = "outputs/trajectory.npy"
 
+if Path(TRAJECTORY_FILE).exists():
+    offsets = np.load(TRAJECTORY_FILE)
+    print(f"已加载轨迹: {TRAJECTORY_FILE} ({offsets.shape[0]} 帧)")
+else:
+    T = 300
+    offsets = np.zeros((T, 23))
+    for t in range(T):
+        for j in range(23):
+            offsets[t, j] = (
+                0.08 * np.sin(2 * np.pi * t / 120 + j * 0.4)
+                + 0.04 * np.sin(2 * np.pi * t / 60 + j * 0.7)
+            )
+    print(f"使用模拟舞蹈")
+
+T = offsets.shape[0]
 motion = MotionData(
     joint_names=list(BOOSTER_T1_JOINT_NAMES),
     fps=30,
     num_frames=T,
-    angles=angles,
+    angles=offsets,
     timestamps=np.arange(T) / 30.0,
 )
 
-# ---- 播放并导出视频 ----
 player = MuJoCoPlayerImpl(width=640, height=480)
 player.load_model("scene.xml")
 
