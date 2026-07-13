@@ -1,7 +1,7 @@
 """
-姿态提取模块 - PromptHMR 实现
-当前为联调占位 Mock 版本，完全对齐 Booster T1 标准接口
-TODO: 待获取预训练权重后，替换为真实深度学习推理
+姿态提取模块 - Mock 实现
+严格遵循 Booster T1 项目统一 PoseExtractor 接口规范，
+输出标准 MotionData 格式，用于模块联调与全流程验证。
 """
 import sys
 import os
@@ -20,11 +20,14 @@ logger = setup_logger("pose_extractor")
 
 
 class PromptHMRExtractor(PoseExtractor):
-    """Mock 姿态提取器，用于接口联调；权重到位后可无缝替换为真实推理"""
+    """
+    姿态提取器 Mock 实现
+    完全对齐项目标准 PoseExtractor 接口，输出合规 MotionData，支持上下游模块联调
+    """
 
     def __init__(self, **kwargs):
         super().__init__()
-        logger.info("已加载 Mock 姿态提取器（联调占位版本）")
+        logger.info("姿态提取模块（Mock版）初始化完成")
 
     def extract(
         self,
@@ -33,21 +36,21 @@ class PromptHMRExtractor(PoseExtractor):
         **kwargs,
     ) -> MotionData:
         total_frames = len(frames)
-        logger.info(f"Mock 姿态提取：模拟处理 {total_frames} 帧，帧率 {fps}")
+        logger.info(f"姿态提取：处理 {total_frames} 帧，帧率 {fps}")
 
-        # 生成模拟 23 个关节 3D 坐标，与 Booster T1 标准关节数严格对齐
-        dummy_joints = np.random.randn(total_frames, BOOSTER_T1_JOINT_NAMES.__len__(), 3) * 0.3
+        # 生成与 Booster T1 标准关节数对齐的模拟关节位置数据
+        dummy_positions = np.random.randn(total_frames, len(BOOSTER_T1_JOINT_NAMES), 3) * 0.3
 
         motion_data = MotionData(
             joint_names=BOOSTER_T1_JOINT_NAMES,
             fps=fps,
             num_frames=total_frames,
-            positions=dummy_joints,
+            positions=dummy_positions,
         )
         return motion_data
 
     def get_joint_map(self) -> dict:
-        """返回 SMPLX 关节到 Booster T1 标准关节的映射表"""
+        """返回通用人体关节到 Booster T1 标准关节的映射表"""
         joint_map = {
             "pelvis": "root",
             "left_hip": "left_hip",
