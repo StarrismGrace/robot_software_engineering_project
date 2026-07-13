@@ -43,6 +43,11 @@ class MuJoCoPlayerImpl(MuJoCoPlayer):
 
         self._model = mujoco.MjModel.from_xml_path(str(model_path))
         self._data = mujoco.MjData(self._model)
+
+        # 重置到 home 关键帧，机器人稳定站立
+        if self._model.nkey > 0:
+            mujoco.mj_resetDataKeyframe(self._model, self._data, 0)
+
         self._renderer = mujoco.Renderer(self._model, self._height, self._width)
 
         self._actuator_ids = list(range(self._model.nu))
