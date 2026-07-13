@@ -93,13 +93,38 @@ class MuJoCoPlayerImpl(MuJoCoPlayer):
             )
             logger.info(f"视频输出: {output_path}")
 
+        # 缓存关节限位（通过 actuator → joint 映射获取）
+        jnt_limits = []
+        for j in range(J):
+            jnt_id = self._model.actuator_trnid[j][0]
+            lo = float(self._model.jnt_range[jnt_id][0])
+            hi = float(self._model.jnt_range[jnt_id][1])
+            jnt_limits.append((lo, hi))
+
         try:
             for _ in range(loop):
                 for t in range(T):
-                    # 直接设置关节角度，不依赖物理控制器
-                    self._data.qpos[FREE_DOF : FREE_DOF + J] = (
-                        self._home_qpos[FREE_DOF : FREE_DOF + J] + angles[t, :J]
-                    )
+                    # 驱动关节
+                    for j in range(J):
+                        val = float(self._home_qpos[FREE_DOF + j]) + float(angles[t, j])
+                        lo, hi = jnt_limits[j]
+                        self._data.qpos[FREE_DOF + j] = np.clip(val, lo, hi)
+
+                    # 身体倾斜：从腰关节推算（腿已锁，用腰扭+肩差模拟体态）
+                    waist = float(self._data.qpos[FREE_DOF + 10])
+                    sh_L = float(self._data.qpos[FREE_DOF + 2])
+                    sh_R = float(self._data.qpos[FREE_DOF + 6])
+                    lean_fwd = (sh_L + sh_R) / 2 * 0.02
+                    lean_side = waist * 0.04
+
+                    # 绕 X(前倾) 和 Y(侧倾) 微旋转自由关节
+                    qw = 1.0 - abs(lean_fwd) - abs(lean_side)
+                    qx = lean_fwd * 0.5
+                    qy = lean_side * 0.5
+                    qz = 0.0
+                    qn = np.sqrt(qw**2 + qx**2 + qy**2 + qz**2)
+                    self._data.qpos[0:3] = self._home_qpos[0:3]
+                    self._data.qpos[3:7] = np.array([qw, qx, qy, qz]) / qn
                     self._data.qvel[:] = 0.0
                     mujoco.mj_forward(self._model, self._data)
 
