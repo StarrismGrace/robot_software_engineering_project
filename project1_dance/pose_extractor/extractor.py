@@ -3,6 +3,7 @@
 严格遵循 Booster T1 项目统一 PoseExtractor 接口规范，
 输出标准 MotionData 格式，用于模块联调与全流程验证。
 """
+
 import sys
 import os
 import numpy as np
@@ -39,7 +40,9 @@ class PromptHMRExtractor(PoseExtractor):
         logger.info(f"姿态提取：处理 {total_frames} 帧，帧率 {fps}")
 
         # 生成与 Booster T1 标准关节数对齐的模拟关节位置数据
-        dummy_positions = np.random.randn(total_frames, len(BOOSTER_T1_JOINT_NAMES), 3) * 0.3
+        dummy_positions = (
+            np.random.randn(total_frames, len(BOOSTER_T1_JOINT_NAMES), 3) * 0.3
+        )
 
         motion_data = MotionData(
             joint_names=BOOSTER_T1_JOINT_NAMES,
